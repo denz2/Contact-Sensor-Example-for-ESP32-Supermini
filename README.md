@@ -13,3 +13,7 @@ I am using ESP32H2 device.
 
 I will add more main_app files as I need it to be used with a battery. 
 
+To run the prerequisities file you will likely need to do this
+chmod + Prerequisities.sh
+sed -i 's/\r//' ./Prerequisities.sh
+
