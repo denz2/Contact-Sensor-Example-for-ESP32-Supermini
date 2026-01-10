@@ -17,3 +17,9 @@ To run the prerequisities file you will likely need to do this
 chmod + Prerequisities.sh
 sed -i 's/\r//' ./Prerequisities.sh
 
+I have also added this in bash.rc so that later on I can activate by calling get_idf etc
+
+alias get_idf=' . ~/esp-idf/export.sh'
+alias get_matter=' . ~/esp-matter/export.sh'
+alias set_cache='export IDF_CCACHE_ENABLE=1'
+
