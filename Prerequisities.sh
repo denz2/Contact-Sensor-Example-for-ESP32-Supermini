@@ -28,7 +28,7 @@ cd ~/esp-idf
 echo "=== Activating ESP-IDF environment ==="
 source export.sh
 
-echo "=== Cloning ESP-Matter (release/v1.5, shallow) ==="
+echo "=== Cloning ESP-Matter (release/v1.4, shallow) ==="
 cd ~
 if [ ! -d "esp-matter" ]; then
     git clone https://github.com/espressif/esp-matter.git
@@ -53,3 +53,4 @@ echo "  cd ~/esp-idf && source export.sh"
 echo "  cd ~/esp-matter/examples/contact-sensor"
 echo "  idf.py set-target esp32h2"
 echo "  idf.py build"
+
