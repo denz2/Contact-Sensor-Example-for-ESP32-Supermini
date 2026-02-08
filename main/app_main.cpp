@@ -7,6 +7,8 @@
    CONDITIONS OF ANY KIND, either express or implied.
 */
 
+
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -25,12 +27,16 @@
 #include <app/server/Server.h>
 #include <platform/CHIPDeviceLayer.h>
 
+
 #if CHIP_DEVICE_CONFIG_ENABLE_THREAD
 #include <platform/ESP32/OpenthreadLauncher.h>
 #include <esp_openthread.h>
 #include <esp_openthread_types.h>
 #include <app_openthread_config.h>
+#include <openthread/thread.h>
+#include <openthread/link.h>
 #endif
+
 #include <platform/CHIPDeviceConfig.h>
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
@@ -55,7 +61,22 @@ static const char *TAG = "CONTACT_SENSOR";
 static uint16_t low_ep_id  = 0;
 static uint16_t full_ep_id = 0;
 static bool commissioning_active = false;
-TaskHandle_t led_task_handle = NULL;
+
+/* --- GLOBAL HANDLES --- */
+static TaskHandle_t hardware_task_handle = NULL;
+static TaskHandle_t led_task_handle = NULL;
+
+/* --- ISR HANDLER (Must be ABOVE hardware_task) --- */
+static void IRAM_ATTR contact_sensor_isr_handler(void* arg) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    vTaskNotifyGiveFromISR(hardware_task_handle, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+}
+
+
+// This variable survives Deep Sleep on the ESP32-H2
+static RTC_DATA_ATTR float smoothed_bat_mv = 0.0f; 
+
 
 /* ========================================================================
  * LED FUNCTIONS
@@ -94,17 +115,6 @@ static void open_commissioning_window_if_necessary() {
     }
 }
 
-uint8_t calculate_percentage(uint32_t voltage_mv) {
-    // CR123A: 3000mV (full) to 2500mV (empty)
-    const uint32_t max_mv = 3000;
-    const uint32_t min_mv = 2500;
-    
-    if (voltage_mv > max_mv) return 200;  // 100% in Matter (0.5% steps)
-    if (voltage_mv < min_mv) return 0;    // 0%
-    
-    return (uint8_t)(((voltage_mv - min_mv) * 200) / (max_mv - min_mv));
-}
-
 /* ========================================================================
  * MATTER CALLBACKS
  * ======================================================================== */
@@ -141,54 +151,121 @@ static void app_event_cb(const chip::DeviceLayer::ChipDeviceEvent *event, intptr
 }
 
 /* ========================================================================
- * HARDWARE TASK - Contact Sensors + Factory Reset
+ * BATTERY TASK - Optimized for long battery life
  * ======================================================================== */
-// 1. Define a handle for the task
-static TaskHandle_t hardware_task_handle = NULL;
 
-// 2. Simple ISR (Interrupt Service Routine)
-static void IRAM_ATTR contact_sensor_isr_handler(void* arg) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    vTaskNotifyGiveFromISR(hardware_task_handle, &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+
+static void battery_task(void *pvParameters) {
+    vTaskDelay(pdMS_TO_TICKS(15000)); // Matter stability delay
+    
+    while (true) {
+        adc_oneshot_unit_handle_t adc_handle;
+        adc_oneshot_unit_init_cfg_t init_config = { .unit_id = ADC_UNIT_1 };
+        adc_oneshot_new_unit(&init_config, &adc_handle);
+        
+        adc_oneshot_chan_cfg_t config = { .atten = ADC_ATTEN_DB_6, .bitwidth = ADC_BITWIDTH_DEFAULT };
+        adc_oneshot_config_channel(adc_handle, BATTERY_ADC_CHANNEL, &config);
+        
+        adc_cali_handle_t cali_handle = NULL;
+        adc_cali_curve_fitting_config_t cali_config = {
+            .unit_id = ADC_UNIT_1, .atten = ADC_ATTEN_DB_6, .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        adc_cali_create_scheme_curve_fitting(&cali_config, &cali_handle);
+        
+        int32_t raw_acc = 0;
+        int count = 0;
+        for (int i = 0; i < 15; i++) {
+            int val;
+            if (adc_oneshot_read(adc_handle, BATTERY_ADC_CHANNEL, &val) == ESP_OK) {
+                if (i >= 5) { raw_acc += val; count++; }
+            }
+            vTaskDelay(pdMS_TO_TICKS(150));
+        }
+        
+        int pin_mv;
+        adc_cali_raw_to_voltage(cali_handle, (raw_acc / count), &pin_mv);
+        
+        // 1. FINAL CALIBRATED MULTIPLIER (1730)
+        uint32_t current_reading_mv = (pin_mv * 1730) / 1000;
+
+        // 2. EMA FILTER (Saves to RTC Memory)
+        if (smoothed_bat_mv < 2000.0f || smoothed_bat_mv > 4500.0f) {
+            smoothed_bat_mv = (float)current_reading_mv;
+        } else {
+            smoothed_bat_mv = (current_reading_mv * 0.1f) + (smoothed_bat_mv * 0.9f);
+        }
+        
+        uint32_t battery_mv = (uint32_t)smoothed_bat_mv;
+        
+        // 3. FINAL PERCENTAGE LOGIC (3150mV = 100%, 2600mV = 0%)
+        uint8_t percentage;
+        if (battery_mv >= 3150) {
+            percentage = 200; 
+        } else if (battery_mv <= 2600) {
+            percentage = 0;
+        } else {
+            // Range is 550mV (3150 - 2600)
+            percentage = (uint8_t)((battery_mv - 2600) * 200 / 550);
+        }
+        
+        adc_cali_delete_scheme_curve_fitting(cali_handle);
+        adc_oneshot_del_unit(adc_handle);
+        
+        chip::DeviceLayer::SystemLayer().ScheduleLambda([battery_mv, percentage]() {
+            esp_matter_attr_val_t v_v = esp_matter_nullable_uint32(battery_mv);
+            esp_matter_attr_val_t v_p = esp_matter_nullable_uint8(percentage);
+            attribute::report(low_ep_id, PowerSource::Id, PowerSource::Attributes::BatVoltage::Id, &v_v);
+            attribute::report(low_ep_id, PowerSource::Id, PowerSource::Attributes::BatPercentRemaining::Id, &v_p);
+            ESP_LOGI("BATT", "Reported: %lu mV (%d%%)", battery_mv, percentage / 2);
+        });
+        
+        vTaskDelay(pdMS_TO_TICKS(86400000)); // Daily check
+    }
 }
 
+/* ========================================================================
+ * HARDWARE TASK - Contact Sensors + Factory Reset
+ * ======================================================================== */
 static void hardware_task(void *arg) {
     hardware_task_handle = xTaskGetCurrentTaskHandle();
 
-    // 1. Initial Setup
+    // 1. Setup GPIO Interrupts
     gpio_install_isr_service(0);
     gpio_set_intr_type(CONTACT_LOW_PIN, GPIO_INTR_ANYEDGE);
     gpio_set_intr_type(CONTACT_FULL_PIN, GPIO_INTR_ANYEDGE);
     gpio_isr_handler_add(CONTACT_LOW_PIN, contact_sensor_isr_handler, NULL);
     gpio_isr_handler_add(CONTACT_FULL_PIN, contact_sensor_isr_handler, NULL);
 
-    // 2. Wait for stack to be stable before first report
+    // 2. Boot Delay (Prevents Watchdog issues during startup)
     vTaskDelay(pdMS_TO_TICKS(10000));
     
-      // Initial Sync
+    // 3. Initial Sync: Report current state to Matter on boot
     bool initial_low = (gpio_get_level(CONTACT_LOW_PIN) == 0);
     bool initial_full = (gpio_get_level(CONTACT_FULL_PIN) == 0);
     
     chip::DeviceLayer::SystemLayer().ScheduleLambda([initial_low, initial_full]() {
-        // Create the value first
         esp_matter_attr_val_t v1 = esp_matter_bool(initial_low);
         attribute::report(low_ep_id, BooleanState::Id, BooleanState::Attributes::StateValue::Id, &v1);
         
         esp_matter_attr_val_t v2 = esp_matter_bool(initial_full);
         attribute::report(full_ep_id, BooleanState::Id, BooleanState::Attributes::StateValue::Id, &v2);
+        
+        ESP_LOGI("BOOT", "Sync: Low=%d Full=%d", initial_low, initial_full);
     });
 
-    while (true) {
-        // 3. BLOCK (This is where the CPU sleeps at 3.6uA)
+        while (true) {
+        // 4. Sleep until the ISR sends a notification (3.6uA mode)
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY); 
 
-        // Debounce & Flash
-        gpio_set_level((gpio_num_t)COMM_LED_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(50)); 
-        gpio_set_level((gpio_num_t)COMM_LED_GPIO, 0);
+        // 5. Short 50ms Blue Flash on movement
+        led_set(true);                  
+        vTaskDelay(pdMS_TO_TICKS(50)); // Reduced to 50ms to save battery
+        led_set(false);                 
 
-        // Define BOTH variables here so they are "in scope" for the log below
+        // 6. Short debounce delay
+        vTaskDelay(pdMS_TO_TICKS(30));
+
+        // 7. Report the change to the Matter Hub
         bool cur_low = (gpio_get_level(CONTACT_LOW_PIN) == 0);
         bool cur_full = (gpio_get_level(CONTACT_FULL_PIN) == 0);
 
@@ -199,118 +276,63 @@ static void hardware_task(void *arg) {
             esp_matter_attr_val_t v_f = esp_matter_bool(cur_full);
             attribute::report(full_ep_id, BooleanState::Id, BooleanState::Attributes::StateValue::Id, &v_f);
         });
-        
-        // Use cur_low and cur_full (NOT raw_low/raw_full)
-        ESP_LOGI("HW", "Device Woke Up & Reported: Low=%d Full=%d", (int)cur_low, (int)cur_full);
     }
+
 }
-
-/* ========================================================================
- * BATTERY TASK - Voltage + Percentage Monitoring
- * ======================================================================== */
-static void battery_task(void *pvParameters) {
-    // Wait for initial stability
-    vTaskDelay(pdMS_TO_TICKS(10000));
-    
-    adc_oneshot_unit_handle_t adc_handle;
-    adc_oneshot_unit_init_cfg_t init_config = { .unit_id = ADC_UNIT_1 };
-    adc_oneshot_new_unit(&init_config, &adc_handle);
-    adc_oneshot_chan_cfg_t config = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT };
-    adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_0, &config);
-
-    while (true) {
-        int val = 0, raw_adc = 0;
-        // NO DELAY LOOP: Keeps CPU awake for only ~1ms
-        for (int i = 0; i < 10; i++) {
-            adc_oneshot_read(adc_handle, ADC_CHANNEL_0, &val);
-            raw_adc += val;
-        }
-        raw_adc /= 10;
-
-        // Math for CR123A (3.0V nominal) with 100k/100k divider
-        uint32_t battery_mv = (raw_adc * 2450 / 4095) * 2; 
-        uint8_t percentage = (battery_mv >= 3100) ? 200 : (battery_mv <= 2600) ? 0 : (uint8_t)((battery_mv - 2600) * 200 / 500);
-
-        chip::DeviceLayer::SystemLayer().ScheduleLambda([battery_mv, percentage]() {
-            esp_matter_attr_val_t v_v = esp_matter_nullable_uint32(battery_mv);
-            attribute::update(low_ep_id, PowerSource::Id, PowerSource::Attributes::BatVoltage::Id, &v_v);
-            esp_matter_attr_val_t v_p = esp_matter_nullable_uint8(percentage);
-            attribute::update(low_ep_id, PowerSource::Id, PowerSource::Attributes::BatPercentRemaining::Id, &v_p);
-        });
-      vTaskDelay(pdMS_TO_TICKS(43200000)); // Check every 12 hours
-    }
-}
-/* ========================================================================
- * REFRESH ATTRIBUTES ON ENDPOINTS AT START
- * ======================================================================== */
-static void sync_sensor_state_at_boot() {
-    // Read physical state: 0 = Closed (Low), 1 = Open (High)
-    bool is_low_closed = (gpio_get_level((gpio_num_t)CONTACT_LOW_PIN) == 0);
-    bool is_full_closed = (gpio_get_level((gpio_num_t)CONTACT_FULL_PIN) == 0);
-
-    // Update Matter attributes immediately
-    esp_matter_attr_val_t val = esp_matter_bool(is_low_closed);
-    esp_matter::attribute::update(low_ep_id, chip::app::Clusters::BooleanState::Id, 
-                                  chip::app::Clusters::BooleanState::Attributes::StateValue::Id, &val);
-
-    val = esp_matter_bool(is_full_closed);
-    esp_matter::attribute::update(full_ep_id, chip::app::Clusters::BooleanState::Id, 
-                                  chip::app::Clusters::BooleanState::Attributes::StateValue::Id, &val);
-    
-    ESP_LOGI("BOOT", "Initial Sync: Low=%s, Full=%s", 
-             is_low_closed ? "Closed" : "Open", is_full_closed ? "Closed" : "Open");
-}
-		
-            
-       
 
 /* ========================================================================
  * SLEEP & POWER MANAGEMENT
  * ======================================================================== */
 void configure_sed_parameters() {
 #if CHIP_DEVICE_CONFIG_ENABLE_THREAD
-    // Note: Device type is set via sdkconfig (CONFIG_OPENTHREAD_MTD=y)
-    // Polling interval matches sdkconfig setting
-    uint32_t idleIntervalMS = 15000;  // 15 seconds (max without LIT support)
-    chip::DeviceLayer::ConnectivityMgr().SetPollingInterval(
-        chip::System::Clock::Milliseconds32(idleIntervalMS)
+    // ICD handles polling automatically via sdkconfig
+    // Just set the device type
+    chip::DeviceLayer::ConnectivityMgr().SetThreadDeviceType(
+        chip::DeviceLayer::ConnectivityManager::kThreadDeviceType_SleepyEndDevice
     );
-    ESP_LOGI(TAG, "Thread polling interval set to %lu ms", idleIntervalMS);
+    
+    ESP_LOGI(TAG, "ICD Mode Enabled: Slow Poll=30s, LIT support active");
 #endif
 }
 
 void init_power_management() {
-    // Check if we are commissioned
-    if (chip::Server::GetInstance().GetFabricTable().FabricCount() > 0) {
-        esp_pm_config_t pm_config = {
-            .max_freq_mhz = 96,
-            .min_freq_mhz = 8, // To lower power usuage
-            .light_sleep_enable = true // MUST stay true for auto-sleep
-        };
-        ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
-        ESP_LOGI(TAG, "Power Management: Automatic Light Sleep Enabled");
-    } else {
-        // While commissioning, we keep sleep disabled to ensure BLE/Thread pairing is fast
-        ESP_LOGI(TAG, "Power Management: Performance Mode for Commissioning");
+    esp_pm_config_t pm_config = {
+        .max_freq_mhz = 96,
+        .min_freq_mhz = 32, // Increased from 8 to 32 for stability
+        .light_sleep_enable = true
+    };
+    // Use ESP_LOG instead of CHECK to prevent rebooting on error
+    esp_err_t err = esp_pm_configure(&pm_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to config PM (%d)", err);
     }
 }
 
 void setup_gpio_wakeup() {
-    gpio_wakeup_enable(CONTACT_LOW_PIN, GPIO_INTR_LOW_LEVEL);
-    gpio_wakeup_enable(CONTACT_FULL_PIN, GPIO_INTR_LOW_LEVEL);
-    esp_sleep_enable_gpio_wakeup();
-    ESP_LOGI("SLEEP", "GPIO wakeup configured for pins %d and %d", 
-             CONTACT_LOW_PIN, CONTACT_FULL_PIN);
+    // 1. Configure the pins for wakeup when pulled LOW (magnet present)
+    // On H2, we use gpio_wakeup_enable for both Light and Deep sleep
+    ESP_ERROR_CHECK(gpio_wakeup_enable(CONTACT_LOW_PIN, GPIO_INTR_LOW_LEVEL));
+    ESP_ERROR_CHECK(gpio_wakeup_enable(CONTACT_FULL_PIN, GPIO_INTR_LOW_LEVEL));
+
+    // 2. Enable the global GPIO wakeup source
+    ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
+
+    ESP_LOGI("SLEEP", "H2 Wakeup configured for Pins 4 & 5");
 }
+
+
 
 /* ========================================================================
  * MAIN APPLICATION
  * ======================================================================== */
 extern "C" void app_main() {
+    // 1. Initialize NVS and partitions
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase(); nvs_flash_init();
+        nvs_flash_erase();
+        nvs_flash_init();
     }
+    nvs_flash_init_partition("fctry");
 
 #if CHIP_DEVICE_CONFIG_ENABLE_THREAD
     esp_vfs_eventfd_config_t eventfd_config = ESP_VFS_EVENTD_CONFIG_DEFAULT();
@@ -323,49 +345,67 @@ extern "C" void app_main() {
     set_openthread_platform_config(&ot_config);
 #endif
 
-    // GPIO Setup for External Resistors
+    // 2. GPIO Setup (Pull-ups DISABLED for 470k resistors)
     gpio_config_t io = {};
     io.pin_bit_mask = (1ULL << CONTACT_LOW_PIN) | (1ULL << CONTACT_FULL_PIN) | (1ULL << RESET_BUTTON_PIN);
     io.mode = GPIO_MODE_INPUT;
-    io.pull_up_en = GPIO_PULLUP_DISABLE; // Using external 100k
+    io.pull_up_en = GPIO_PULLUP_DISABLE;
+    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
     gpio_config(&io);
 
     led_init();
     setup_gpio_wakeup();
-	
-	
-	    // 1. CREATE DATA MODEL
+
+    // 3. Create Node and Endpoints
     node::config_t node_config;
     node_t *node = node::create(&node_config, app_attribute_update_cb, NULL);
 
-    // Create a default config for the endpoints (DO NOT PASS NULL)
     contact_sensor::config_t sensor_config; 
-
-    // Endpoint 1: Low Sensor
     endpoint_t *low_ep = contact_sensor::create(node, &sensor_config, ENDPOINT_FLAG_NONE, NULL);
     low_ep_id = endpoint::get_id(low_ep);
 
-    // Endpoint 2: Full Sensor
     endpoint_t *full_ep = contact_sensor::create(node, &sensor_config, ENDPOINT_FLAG_NONE, NULL);
     full_ep_id = endpoint::get_id(full_ep);
 
-    
-    // Create Power Cluster
+  // 4. Power Source Cluster
     cluster_t *ps_cluster = cluster::create(low_ep, PowerSource::Id, CLUSTER_FLAG_SERVER);
-    cluster::global::attribute::create_feature_map(ps_cluster, 0x02);
-    cluster::power_source::attribute::create_bat_voltage(ps_cluster, nullable<uint32_t>(3000), 0, 65535);
-    cluster::power_source::attribute::create_bat_percent_remaining(ps_cluster, nullable<uint8_t>(200), 0, 200);
+    if (ps_cluster) {
+        cluster::global::attribute::create_feature_map(ps_cluster, 0x02);
+        cluster::power_source::attribute::create_bat_charge_level(ps_cluster, 1);
+        
+        // Fix: Provide (Initial Value, Min, Max) as expected by your SDK version
+        // Voltage: Initial 3200mV, Min 0mV, Max 65535mV
+        cluster::power_source::attribute::create_bat_voltage(
+            ps_cluster, 
+            nullable<uint32_t>(3200), 
+            nullable<uint32_t>(0), 
+            nullable<uint32_t>(65535)
+        );
+        
+        // Percent: Initial 200 (100%), Min 0, Max 200
+        cluster::power_source::attribute::create_bat_percent_remaining(
+            ps_cluster, 
+            nullable<uint8_t>(200), 
+            nullable<uint8_t>(0), 
+            nullable<uint8_t>(200)
+        );
+        
+        ESP_LOGI("APP", "Power Source Cluster created successfully");
+    }
 
-      // Initial Start
+    // 5. Start Matter Stack
     esp_matter::start(app_event_cb);
 
- 
-  
+    // Give the data model a moment to stabilise internally
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
-    if (chip::Server::GetInstance().GetFabricTable().FabricCount() > 0) {
+    // 6. Commissioning and Power Logic
+    bool is_commissioned = (chip::Server::GetInstance().GetFabricTable().FabricCount() > 0);
+    
+    if (is_commissioned) {
         commissioning_active = false;
         chip::DeviceLayer::SystemLayer().ScheduleLambda([]() {
-            configure_sed_parameters();
+            configure_sed_parameters(); 
             init_power_management();
         });
     } else {
@@ -373,11 +413,8 @@ extern "C" void app_main() {
         xTaskCreate(commissioning_led_task, "comm_led", 2048, NULL, 5, &led_task_handle);
     }
 
-    // Always create these. 
+    // 7. Start Hardware and Battery Tasks (Increased stacks for H2/Matter)
     xTaskCreate(hardware_task, "hw", 4096, NULL, 5, &hardware_task_handle);
-    xTaskCreate(battery_task, "bat", 4096, NULL, 2, NULL); 
+    xTaskCreate(battery_task, "bat", 5120, NULL, 2, NULL);
 }
-
-
-
 
