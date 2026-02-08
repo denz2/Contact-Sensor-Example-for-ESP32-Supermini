@@ -11,6 +11,7 @@ This is info is from espressif website.
 
 I am using ESP32H2 device.
 
+I am using cr123 battery 470k resistors from minus and plus to gpio0
 
 To run the prerequisities file you will likely need to do this
 chmod + Prerequisities.sh
